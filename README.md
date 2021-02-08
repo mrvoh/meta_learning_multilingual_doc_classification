@@ -38,6 +38,32 @@ pip install -r requirements.txt
 ```
 
 ## Data pre-processing
+Each document/sample is stored as a separate ```*.json ```, formatted as follows:
+```buildoutcfg
+
+```
+
+The whole dataset has to be stored in the ```datasets``` folder in the same directory as ```train_maml_system.py``` with the following folder structure:
+```
+Dataset
+    ||
+ ___||_________
+|       |     |
+train   val  test
+|___________.....
+|                |
+Dataset_1        Dataset_D
+|______________.....
+|       |           |
+lang_1  lang_2      lang_L 
+    |       |            |
+ class_0 class_1 ... class_N
+    |       |___________________
+    |                           |
+samples for class_0    samples for class_1
+```
+So for instance, the first sample from the MLDoc dataset, corresponding to class ```ECAT``` in French would be located at ```datasets/Dataset/train/MLDoc/fr/ECAT/sample1.json```
+
 
 ## Running an experiment
 
