@@ -4,13 +4,11 @@ This repository is based on the work of Antreas Antoniou, [How To Train Your MAM
 | Section | Description |
 |-|-|
 | [Setup](#setup) | How to setup a working environment |
-| [Architectures](#architectures) | Available models |
 | [Data and Preprocessing](#data-and-preprocessing) | How to prepare and utilize a (custom) dataset |
-| [Training/evaluating](#training/evaluating) | Train and evaluate a model |
-| [Using FastText](#using-fasttext) | Create custom word vectors or baseline model |
-| [Using ULMFiT](#using-ulmfit) | Using ULMFiT as word encoder and to create document encodings |
-| [Hyperparameter optimization](#hyperparameter-optimization) | Finding optimal hyperparameters using [Hyperopt](https://github.com/hyperopt/hyperopt) |
-| [References](#references) | References for this repo | 
+| [Supported meta-learning algorithms](#supported-meta-learning-algorithms) | Learning methods|
+| [Supported base-learners](#supported base-learners) | Base-learners |
+| [Running an experiment](#running-an-experiment) | How to configure and run an experiment |
+| [Citation](#citation) | Citing our work| 
 
 ## Setup
 
