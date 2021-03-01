@@ -6,7 +6,7 @@ This repository is based on the work of Antreas Antoniou, [How To Train Your MAM
 | [Setup](#setup) | How to setup a working environment |
 | [Data and Preprocessing](#data-and-preprocessing) | How to prepare and utilize a (custom) dataset |
 | [Supported meta-learning algorithms](#supported-meta-learning-algorithms) | Learning methods|
-| [Supported base-learners](#supported base-learners) | Base-learners |
+| [Supported base-learners](#supported-base-learners) | Base-learners |
 | [Running an experiment](#running-an-experiment) | How to configure and run an experiment |
 | [Citation](#citation) | Citing our work| 
 
