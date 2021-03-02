@@ -149,10 +149,11 @@ The following options are configurable:
 
 Please cite our [paper](https://arxiv.org/abs/2101.11302) if you use it in your own work.
 ```bibtex
-@article{van2021multilingual,
+@inproceedings{van2021multilingual,
   title={Multilingual and cross-lingual document classification: A meta-learning approach},
   author={van der Heijden, Niels and Yannakoudakis, Helen and Mishra, Pushkar and Shutova, Ekaterina},
-  journal={arXiv preprint arXiv:2101.11302},
+  booktitle={Proceedings of the 2021 Conference of the European Chapter of the Association for Computational Linguistics},
   year={2021}
 }
+
 ```
