@@ -1,3 +1,6 @@
+# IMPORTANT:
+I recently found I created a bug while cleaning this repo, resulting in far worse performance. I will update the repo soon.
+
 # Multilingual and cross-lingual document classification: A meta-learning approach
 This repository is based on the work of Antreas Antoniou, [How To Train Your MAML](https://github.com/AntreasAntoniou/HowToTrainYourMAMLPytorch).
 ## Contents
