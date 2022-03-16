@@ -1,5 +1,13 @@
-# IMPORTANT:
-I recently found I created a bug while cleaning this repo, resulting in far worse performance. I will update the repo soon.
+# Bug fix update
+I updated the code-base with code from my follow-up research, in which the bug is solved. I decided to include all my progress as I did not finish the project, but definitely think there are interesting things in there which might be useful for others.
+High-over, what is added:
+* Support for Adapter-Transformers
+* Support for all kinds of auxiliary losses: triplet loss, consistency loss in line with [this paper](https://arxiv.org/abs/1904.12848) (which does require augmented data) and a loss forcing the final feature space to be convex (i.e. interpolating in feature space should result in the same interpolation in output space)
+* Multi-task learning loss components which can compensate for imbalance in nr of labels per task and [uncertainty inherent to a task](https://arxiv.org/abs/1705.07115) 
+* A spin-off model from ProtoMAML which can use user-defined class descriptions as prototypes instead of the center of the embedded support set. This model also supports splitting the support set such that one half is used  to initialize prototypes and the other one to perform inner-loop optimization.
+* More extra's to push performance such as Stochastic Weight Averaging and ensemble techniques such as majority voting (based on new model described in previous point)
+
+For a partial write-up of the above implementations, feel free to contact me.
 
 # Multilingual and cross-lingual document classification: A meta-learning approach
 This repository is based on the work of Antreas Antoniou, [How To Train Your MAML](https://github.com/AntreasAntoniou/HowToTrainYourMAMLPytorch).
