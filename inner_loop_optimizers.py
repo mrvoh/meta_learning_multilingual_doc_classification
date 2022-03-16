@@ -78,6 +78,7 @@ class LSLRGradientDescentLearningRule(nn.Module):
         use_learnable_learning_rates,
         init_learning_rate=1e-3,
         init_class_head_lr_multiplier=1,
+        use_adapter=False,
     ):
         """Creates a new learning rule object.
         Args:
@@ -92,8 +93,11 @@ class LSLRGradientDescentLearningRule(nn.Module):
 
         self.init_learning_rate = torch.ones(1) * init_learning_rate
         self.init_class_head_lr_multiplier = init_class_head_lr_multiplier
+        # self.init_learning_rate.to(device)
         self.total_num_inner_loop_steps = total_num_inner_loop_steps
         self.use_learnable_learning_rates = use_learnable_learning_rates
+
+        self.use_adapter = use_adapter
 
     def initialise(self, names_weights_dict):
         self.names_learning_rates_dict = nn.ParameterDict()

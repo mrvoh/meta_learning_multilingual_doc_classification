@@ -7,8 +7,8 @@ import torch
 import numpy as np
 import math
 from transformers.modeling_utils import prune_linear_layer
-from transformers.modeling_roberta import create_position_ids_from_input_ids
-from transformers.modeling_bert import ACT2FN
+from transformers.models.roberta.modeling_roberta import create_position_ids_from_input_ids
+from transformers.models.bert.modeling_bert import ACT2FN
 
 META_ADAPTER_NAME = "adapter"
 
@@ -133,7 +133,6 @@ class MetaBertEmbedding(nn.Module):
         # self.LayerNorm is not snake-cased to stick with TensorFlow model variable name and be able to load
         # any TensorFlow checkpoint file
         self.LayerNorm = MetaLayerNormLayer(config.hidden_size, eps=self.layer_norm_eps)
-        self.dropout_prob = config.dropout if is_distil else config.hidden_dropout_prob
 
     def forward(
         self,
@@ -221,6 +220,7 @@ class MetaRoBertaEmbedding(MetaBertEmbedding):
         position_ids=None,
         inputs_embeds=None,
         params=None,
+        num_step=0,
     ):
 
         if position_ids is None:
@@ -240,6 +240,7 @@ class MetaRoBertaEmbedding(MetaBertEmbedding):
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
             params=params,
+            num_step=num_step,
         )
 
     def create_position_ids_from_inputs_embeds(self, inputs_embeds):
@@ -369,7 +370,7 @@ class MetaBertSelfOutput(nn.Module):
         self.dense = MetaLinearLayer(config.hidden_size, config.hidden_size)
         self.layer_norm_eps = 1e-12 if is_distil else config.layer_norm_eps
         self.LayerNorm = MetaLayerNormLayer(config.hidden_size, eps=self.layer_norm_eps)
-        self.dropout_prob = config.hidden_dropout_prob
+        self.dropout_prob = config.dropout if is_distil else config.hidden_dropout_prob
 
     def forward(self, hidden_states, input_tensor, num_step, params=None):
 
@@ -449,32 +450,28 @@ class MetaBertAttention(nn.Module):
             self.output = MetaBertSelfOutput(config, is_distil)
         self.pruned_heads = set()
 
-    def prune_heads(self, heads):
-        if len(heads) == 0:
-            return
-        mask = torch.ones(self.self.num_attention_heads, self.self.attention_head_size)
-        heads = (
-            set(heads) - self.pruned_heads
-        )  # Convert to set and remove already pruned heads
-        for head in heads:
-            # Compute how many pruned heads are before the head and move the index accordingly
-            head = head - sum(1 if h < head else 0 for h in self.pruned_heads)
-            mask[head] = 0
-        mask = mask.view(-1).contiguous().eq(1)
-        index = torch.arange(len(mask))[mask].long()
-
-        # Prune linear layers
-        self.self.query = prune_linear_layer(self.self.query, index)
-        self.self.key = prune_linear_layer(self.self.key, index)
-        self.self.value = prune_linear_layer(self.self.value, index)
-        self.output.dense = prune_linear_layer(self.output.dense, index, dim=1)
-
-        # Update hyper params and store pruned heads
-        self.self.num_attention_heads = self.self.num_attention_heads - len(heads)
-        self.self.all_head_size = (
-            self.self.attention_head_size * self.self.num_attention_heads
-        )
-        self.pruned_heads = self.pruned_heads.union(heads)
+    # def prune_heads(self, heads):
+    #     if len(heads) == 0:
+    #         return
+    #     mask = torch.ones(self.self.num_attention_heads, self.self.attention_head_size)
+    #     heads = set(heads) - self.pruned_heads  # Convert to set and remove already pruned heads
+    #     for head in heads:
+    #         # Compute how many pruned heads are before the head and move the index accordingly
+    #         head = head - sum(1 if h < head else 0 for h in self.pruned_heads)
+    #         mask[head] = 0
+    #     mask = mask.view(-1).contiguous().eq(1)
+    #     index = torch.arange(len(mask))[mask].long()
+    #
+    #     # Prune linear layers
+    #     self.self.query = prune_linear_layer(self.self.query, index)
+    #     self.self.key = prune_linear_layer(self.self.key, index)
+    #     self.self.value = prune_linear_layer(self.self.value, index)
+    #     self.output.dense = prune_linear_layer(self.output.dense, index, dim=1)
+    #
+    #     # Update hyper params and store pruned heads
+    #     self.self.num_attention_heads = self.self.num_attention_heads - len(heads)
+    #     self.self.all_head_size = self.self.attention_head_size * self.self.num_attention_heads
+    #     self.pruned_heads = self.pruned_heads.union(heads)
 
     def forward(
         self,
@@ -537,9 +534,7 @@ class MetaBertOutput(nn.Module):
         super().__init__()
         self.dense = MetaLinearLayer(config.intermediate_size, config.hidden_size)
         self.layer_norm_eps = 1e-12 if is_distil else config.layer_norm_eps
-        self.LayerNorm = MetaLayerNormLayer(
-            config.hidden_size, eps=config.layer_norm_eps
-        )
+        self.LayerNorm = MetaLayerNormLayer(config.hidden_size, eps=self.layer_norm_eps)
         self.dropout_prob = config.hidden_dropout_prob
 
     def forward(self, hidden_states, input_tensor, num_step, params=None):
@@ -811,6 +806,7 @@ class MetaBertEncoder(nn.Module):
         head_mask=None,
         encoder_hidden_states=None,
         encoder_attention_mask=None,
+        layer_from=0,
     ):
         layer_params = {str(i): None for i in range(len(self.layer))}
 
@@ -821,7 +817,7 @@ class MetaBertEncoder(nn.Module):
 
         all_hidden_states = ()
         all_attentions = ()
-        for i, layer_module in enumerate(self.layer):
+        for i, layer_module in enumerate(self.layer[layer_from:], layer_from):
             if self.output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
@@ -856,9 +852,11 @@ class MetaBertClassHead(nn.Module):
         super().__init__()
 
         self.out_features = config.num_labels
-        self.dense = MetaLinearLayer(config.hidden_size, config.hidden_size)
-        self.activation = nn.Tanh()
-        self.out_proj = MetaLinearLayer(config.hidden_size, config.num_labels)
+        # TODO: tmp
+        penultimate_size = 128
+        self.dense = MetaLinearLayer(config.hidden_size, penultimate_size)
+        self.out_proj = MetaLinearLayer(penultimate_size, config.num_labels)
+        self.dropout_prob = config.hidden_dropout_prob
 
     def forward(self, hidden_states, params=None, return_pooled=False):
         # We "pool" the model by simply taking the hidden state corresponding
@@ -873,13 +871,18 @@ class MetaBertClassHead(nn.Module):
 
         first_token_tensor = hidden_states[:, 0]
         pooled_output = self.dense(first_token_tensor, params=dense_params)
-        pooled_output = self.activation(pooled_output)
-        if return_pooled:
-            return pooled_output
+        # Nonlinearity
+        pooled_output = torch.tanh(pooled_output)
+
+        if self.training:
+            pooled_output = F.dropout(pooled_output, p=self.dropout_prob)
 
         logits = self.out_proj(pooled_output, params=out_params)
 
-        return logits
+        if return_pooled:
+            return logits, pooled_output
+        else:
+            return logits, None
 
 
 class MetaConv2dLayer(nn.Module):

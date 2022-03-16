@@ -9,6 +9,8 @@ from transformers import AutoModelForSequenceClassification
 from torch.utils.tensorboard import SummaryWriter
 import cProfile, pstats, io
 
+from dataloader import *
+
 
 class ExperimentBuilder(object):
     def __init__(self, args, data, model, device):
@@ -32,13 +34,15 @@ class ExperimentBuilder(object):
         self.per_task_performance = defaultdict(lambda: 0)
         self.total_losses = dict()
         self.state = dict()
-        self.state["best_val_loss"] = 10 ** 6
+        self.state["best_val_loss"] = 10**6
         self.state["best_val_accuracy"] = 0
         self.state["best_val_iter"] = 0
         self.state["current_iter"] = 0
         self.start_epoch = 0
         self.num_epoch_no_improvements = 0
         self.patience = args.patience
+        self.num_start_epochs = args.num_start_epochs
+        self.max_models_to_save = self.args.max_models_to_save
         self.create_summary_csv = False
 
         self.writer = SummaryWriter("runs/{}".format(self.args.experiment_name))
@@ -173,32 +177,24 @@ class ExperimentBuilder(object):
         :param pbar_train: The progress bar of the training.
         :return: Updates total_losses, train_losses, current_iter
         """
-        (
-            x_support_set,
-            len_support_set,
-            x_target_set,
-            len_target_set,
-            y_support_set,
-            y_target_set,
-            selected_classes,
-            seed,
-        ) = train_sample
 
-        # Get teacher names and languages
-        teacher_names, langs = zip(*[t.split("_") for t in selected_classes])
+        # # Convert selected_classes to their pretrained directories
+        if self.args.sets_are_pre_split:
+            teacher_names, langs = zip(
+                *[t.split("_") for t in train_sample[SELECTED_CLASS_KEY]]
+            )
+        else:
+            teacher_names, langs = zip(
+                *[
+                    self.idx_to_class_name[selected_class].split("_")
+                    for selected_class in train_sample[SELECTED_CLASS_KEY]
+                ]
+            )
 
-        data_batch = (
-            x_support_set,
-            len_support_set,
-            x_target_set,
-            len_target_set,
-            y_support_set,
-            y_target_set,
-            selected_classes,
-        )
+        train_sample[SELECTED_CLASS_KEY] = teacher_names
 
         losses, task_lang_log = self.model.run_train_iter(
-            data_batch=data_batch, epoch=epoch_idx
+            data_batch=train_sample, epoch=epoch_idx
         )
         for log, lang in zip(task_lang_log, langs):
             log.insert(1, lang)
@@ -252,13 +248,13 @@ class ExperimentBuilder(object):
         for task_name in val_tasks:
             for seed in seeds:
                 print("Evaluating {} with seed {}...".format(task_name, seed))
-                train_dataloader, dev_dataloader = self.data.get_finetune_dataloaders(
-                    task_name, 0, seed
-                )
+                res = self.data.get_finetune_dataloaders(task_name, 0, seed)
+                train_dataloader = res.pop(TRAIN_DATALOADER_KEY)
+                dev_dataloader = res.pop(DEV_DATALOADER_KEY)
 
                 _, best_loss, curr_loss, accuracy = self.model.finetune_epoch(
                     None,
-                    self.model.classifier.config,
+                    self.model.bert_config,
                     train_dataloader,
                     dev_dataloader,
                     task_name=task_name,
@@ -266,6 +262,7 @@ class ExperimentBuilder(object):
                     eval_every=1,
                     model_save_dir=self.saved_models_filepath,
                     best_loss=0,
+                    **res
                 )
 
                 per_val_set_performance[task_name].append(accuracy)
@@ -281,9 +278,14 @@ class ExperimentBuilder(object):
                 )
 
         result["{}_accuracy_mean".format(set_name)] = np.mean(accuracies)
-        result["{}_loss_std".format(set_name)] = np.std(accuracies)
-        result["{}_loss_mean".format(set_name)] = np.mean(losses)
-        result["{}_loss_std".format(set_name)] = np.std(losses)
+        result["{}_accuracy_std".format(set_name)] = np.std(accuracies)
+        for k in losses[0].keys():
+            result["{}_{}_mean".format(set_name, k)] = np.mean(
+                [loss[k] for loss in losses]
+            )
+            result["{}_{}_std".format(set_name, k)] = np.std(
+                [loss[k] for loss in losses]
+            )
 
         if set_meta_loss_back:
             self.model.meta_loss = "kl"
@@ -298,36 +300,19 @@ class ExperimentBuilder(object):
         :param pbar_val: The progress bar of the val stage.
         :return: The updated val_losses, total_losses
         """
-        (
-            x_support_set,
-            len_support_set,
-            x_target_set,
-            len_target_set,
-            y_support_set,
-            y_target_set,
-            selected_classes,
-            seed,
-        ) = val_sample
 
         # Convert selected_classes to their pretrained directories
         if self.args.sets_are_pre_split:
-            teacher_names = [t.split("_")[0] for t in selected_classes]
+            teacher_names = [t.split("_")[0] for t in val_sample[SELECTED_CLASS_KEY]]
         else:
             teacher_names = [
                 self.idx_to_class_name[selected_class].split("_")[0]
-                for selected_class in selected_classes
+                for selected_class in val_sample[SELECTED_CLASS_KEY]
             ]
-        data_batch = (
-            x_support_set,
-            len_support_set,
-            x_target_set,
-            len_target_set,
-            y_support_set,
-            y_target_set,
-            teacher_names,
-        )
 
-        losses = self.model.run_validation_iter(data_batch=data_batch)
+        val_sample[SELECTED_CLASS_KEY] = teacher_names
+
+        losses = self.model.run_validation_iter(data_batch=val_sample)
         for key, value in losses.items():
             if key not in total_losses:
                 total_losses[key] = [float(value)]
@@ -352,35 +337,18 @@ class ExperimentBuilder(object):
         :param pbar_test: The progress bar of the val stage.
         :return: The updated val_losses, total_losses
         """
-        (
-            x_support_set,
-            len_support_set,
-            x_target_set,
-            len_target_set,
-            y_support_set,
-            y_target_set,
-            selected_classes,
-            seed,
-        ) = val_sample
+
         # Convert selected_classes to their pretrained directories
         if self.args.sets_are_pre_split:
-            teacher_names = [t.split("_")[0] for t in selected_classes]
+            teacher_names = [t.split("_")[0] for t in val_sample[SELECTED_CLASS_KEY]]
         else:
             teacher_names = [
                 self.idx_to_class_name[selected_class].split("_")[0]
-                for selected_class in selected_classes
+                for selected_class in val_sample[SELECTED_CLASS_KEY]
             ]
-        data_batch = (
-            x_support_set,
-            len_support_set,
-            x_target_set,
-            len_target_set,
-            y_support_set,
-            y_target_set,
-            teacher_names,
-        )
+        val_sample[SELECTED_CLASS_KEY] = teacher_names
 
-        losses = self.model.run_validation_iter(data_batch=data_batch)
+        losses = self.model.run_validation_iter(data_batch=val_sample)
 
         test_output_update = self.build_loss_summary_string(losses)
 
@@ -583,11 +551,31 @@ class ExperimentBuilder(object):
 
             return train_dataloader, dev_dataloader, self.model.classifier
 
+    def run_profiling(self):
+
+        for train_sample_idx, train_sample in enumerate(
+            self.data.get_train_batches(
+                total_batches=int(
+                    self.args.total_iter_per_epoch * self.args.total_epochs
+                )
+                - self.state["current_iter"]
+            )
+        ):
+            losses, task_lang_log = self.model.run_train_iter(
+                data_batch=train_sample, epoch=0
+            )
+
     def run_experiment(self):
         """
         Runs a full training experiment with evaluations of the model on the val set at every epoch. Furthermore,
         will return the test set evaluation results on the best performing validation model.
         """
+
+        if self.args.majority_vote_at_test_only:
+            try:
+                self.model.use_majority_vote = False
+            except:
+                print("Could not set --use_majority_vote to True at test time")
 
         # pr = cProfile.Profile()
         # pr.enable()
@@ -624,7 +612,11 @@ class ExperimentBuilder(object):
                         sample_idx=self.state["current_iter"],
                     )
 
-                    if self.state["current_iter"] % self.args.total_iter_per_epoch == 0:
+                    if (
+                        self.state["current_iter"] % self.args.total_iter_per_epoch == 0
+                        and self.state["current_iter"] // self.args.total_iter_per_epoch
+                        >= self.num_start_epochs
+                    ):
                         # pr.disable()
                         # pr.print_stats()
                         epoch = (
@@ -663,23 +655,21 @@ class ExperimentBuilder(object):
                                         phase="val",
                                     )
                         # Write metrics to tensorboard
+                        for k in val_losses.keys():
+                            loss_name = k.replace("val_", "")
 
-                        # log metrics
-                        self.writer.add_scalars(
-                            "loss",
-                            {
-                                "train": train_losses["train_loss_mean"],
-                                "val": val_losses["val_loss_mean"],
-                            },
-                            epoch,
-                        )
+                            self.writer.add_scalars(
+                                loss_name,
+                                {
+                                    "train": train_losses["train_" + loss_name],
+                                    "val": val_losses["val_" + loss_name],
+                                },
+                                epoch,
+                            )
 
-                        self.writer.add_scalars(
-                            "Accuracy",
-                            {
-                                "train": train_losses["train_accuracy_mean"],
-                                "val": val_losses["val_accuracy_mean"],
-                            },
+                        self.writer.add_scalar(
+                            "learning rate",
+                            train_losses["train_learning_rate_mean"],
                             epoch,
                         )
 
@@ -785,6 +775,12 @@ class ExperimentBuilder(object):
                             )
 
                             sys.exit()
+
+            if self.args.majority_vote_at_test_only:
+                try:
+                    self.model.use_majority_vote = True
+                except:
+                    print("Could not set --use_majority_vote to True at test time")
 
             print(self.full_task_set_evaluation(epoch=self.epoch, set_name="test"))
             # self.evaluate_test_set_using_the_best_models(top_n_models=5)
