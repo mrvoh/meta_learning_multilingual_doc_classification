@@ -18,6 +18,20 @@ from utils.torch_utils import stack_and_pad_tensors
 import glob
 from collections import defaultdict
 
+SUPPORT_SET_SAMPLES_KEY = "support_set_samples"
+SUPPORT_SET_LENS_KEY = "support_set_lens"
+TARGET_SET_SAMPLES_KEY = "target_set_samples"
+TARGET_SET_LENS_KEY = "target_set_lens"
+SUPPORT_SET_ENCODINGS_KEY = "support_set_encodings"
+TARGET_SET_ENCODINGS_KEY = "target_set_encodings"
+SELECTED_CLASS_KEY = "selected_class"
+SEED_KEY = "seed"
+CLASS_NAMES_KEY = "class_names"
+CLASS_NAMES_ENCODING_KEY = "class_names_encoding"
+CLASS_NAMES_LENS_KEY = "class_names_len"
+TRAIN_DATALOADER_KEY = "train_dataloader"
+DEV_DATALOADER_KEY = "dev_dataloader"
+
 
 class DistilDataLoader(DataLoader):
     def __init__(self, args):
@@ -40,8 +54,14 @@ class DistilDataLoader(DataLoader):
         )
         self.train_val_test_split = args.train_val_test_split
         self.current_set_name = "train"
+        self.proportion_intra_sample = args.proportion_intra_task_sampling
+        self.variable_nr_classes_and_samples = args.variable_nr_classes_and_samples
         self.gold_label_tasks = args.gold_label_tasks
         self.gold_label_task_sample_ratio = args.gold_label_task_sample_ratio
+
+        self.include_label_names = args.use_label_guided_learning
+        self.consistency_training = args.use_consistency_loss
+        self.multilingual_consistency_training = args.use_multilingual_consistency_loss
 
         self.num_target_samples = args.num_target_samples
         self.reset_stored_filepaths = args.reset_stored_filepaths
@@ -185,27 +205,79 @@ class DistilDataLoader(DataLoader):
         :return: Three sets, the training set, validation set and test sets (referred to as the meta-train,
         meta-val and meta-test in the paper)
         """
+        rng = np.random.RandomState(seed=self.seed["val"])
 
-        (
-            data_sample_paths,
-            index_to_label_name_dict_file,
-            label_to_index,
-        ) = self.load_datapaths()
-        dataset_splits = dict()
-        for key, value in data_sample_paths.items():
-            key = self.get_label_from_index(index=key)
-            bits = key.split("/")
-            set_name = bits[0]
-            class_label = bits[1]
-            if set_name not in dataset_splits:
-                dataset_splits[set_name] = {class_label: value}
-            else:
-                dataset_splits[set_name][class_label] = value
-        if "test" not in dataset_splits.keys():
-            print(
-                "No samples in test set are present, continuing with only train and validation set."
+        if self.args.sets_are_pre_split:
+            (
+                data_sample_paths,
+                index_to_label_name_dict_file,
+                label_to_index,
+            ) = self.load_datapaths()
+            dataset_splits = dict()
+            for key, value in data_sample_paths.items():
+                key = self.get_label_from_index(index=key)
+                bits = key.split("/")
+                set_name = bits[0]
+                class_label = bits[1]
+                if set_name not in dataset_splits:
+                    dataset_splits[set_name] = {class_label: value}
+                else:
+                    dataset_splits[set_name][class_label] = value
+            if "test" not in dataset_splits.keys():
+                print(
+                    "No samples in test set are present, continuing with only train and validation set."
+                )
+                dataset_splits["test"] = {}
+
+        else:
+            (
+                data_sample_paths,
+                index_to_label_name_dict_file,
+                label_to_index,
+            ) = self.load_datapaths()
+            total_label_types = len(data_sample_paths)
+            num_classes_idx = np.arange(len(data_sample_paths.keys()), dtype=np.int32)
+
+            rng.shuffle(num_classes_idx)
+            keys = list(data_sample_paths.keys())
+            values = list(data_sample_paths.values())
+            new_keys = [keys[idx] for idx in num_classes_idx]
+            new_values = [values[idx] for idx in num_classes_idx]
+            data_sample_paths = dict(zip(new_keys, new_values))
+            # data_sample_paths = self.shuffle(data_sample_paths)
+            x_train_id, x_val_id, x_test_id = (
+                int(self.train_val_test_split[0] * total_label_types),
+                int(np.sum(self.train_val_test_split[:2]) * total_label_types),
+                int(total_label_types),
             )
-            dataset_splits["test"] = {}
+            print(x_train_id, x_val_id, x_test_id)
+
+            x_train_classes = (
+                class_key for class_key in list(data_sample_paths.keys())[:x_train_id]
+            )
+            x_val_classes = (
+                class_key
+                for class_key in list(data_sample_paths.keys())[x_train_id:x_val_id]
+            )
+            x_test_classes = (
+                class_key
+                for class_key in list(data_sample_paths.keys())[x_val_id:x_test_id]
+            )
+            x_train, x_val, x_test = (
+                {
+                    class_key: data_sample_paths[class_key]
+                    for class_key in x_train_classes
+                },
+                {
+                    class_key: data_sample_paths[class_key]
+                    for class_key in x_val_classes
+                },
+                {
+                    class_key: data_sample_paths[class_key]
+                    for class_key in x_test_classes
+                },
+            )
+            dataset_splits = {"train": x_train, "val": x_val, "test": x_test}
 
         return dataset_splits
 
@@ -230,7 +302,7 @@ class DistilDataLoader(DataLoader):
 
         return class_label, (input_ids, teacher_encodings)
 
-    def load_batch(self, batch_sample_paths):
+    def load_batch(self, batch_sample_paths, class_names):
         """
         Load a batch of samples, given a list of filepaths
         :param batch_sample_paths: A list of filepaths
@@ -238,7 +310,7 @@ class DistilDataLoader(DataLoader):
         """
 
         sample_batch = [
-            self.load_sample(sample_path=sample_path)
+            self.load_sample(sample_path=sample_path, class_names=class_names)
             for sample_path in batch_sample_paths
         ]
 
@@ -247,7 +319,34 @@ class DistilDataLoader(DataLoader):
 
         return (input_ids, teacher_encodings)
 
-    def load_sample(self, sample_path):
+    def get_class_descr_samples(self, class_descr):
+
+        x = []
+        y = []
+        for i, descr in enumerate(class_descr):
+            # get input ids for BERT model
+            input_ids = torch.LongTensor(
+                self.tokenizer.encode(
+                    descr.lower(),
+                    text_pair=None,
+                    add_special_tokens=True,
+                    max_length=512,
+                    truncation=True,
+                )
+            )
+            x.append(input_ids)
+
+            ohe_label = [0] * len(class_descr)
+            ohe_label[i] = 1
+            y.append(torch.FloatTensor(ohe_label))
+
+        # Stack and pad
+        x, mask = stack_and_pad_tensors(x, padding_index=self.tokenizer.pad_token_id)
+        y = torch.stack(y)
+
+        return x, mask, y
+
+    def load_sample(self, sample_path, class_names):
         """
         Given an sample filepath and the number of channels to keep, load an sample and keep the specified channels
         :param sample_path: The sample's filepath
@@ -257,18 +356,20 @@ class DistilDataLoader(DataLoader):
             sample = json.load(f)
 
         seqs = sample["target_sentence"].split("[SEP]")
+        text = seqs[0]
         extra_seq = seqs[1] if len(seqs) > 1 else None
 
         # get input ids for BERT model
         input_ids = torch.LongTensor(
             self.tokenizer.encode(
-                seqs[0],
+                text,
                 text_pair=extra_seq,
                 add_special_tokens=True,
-                max_length=512,
-                truncation=True,
+                # max_length=512,
+                truncation=False,
             )
         )
+        input_ids = input_ids[-512:]
         teacher_encodings = torch.FloatTensor(sample["teacher_encoding"])
 
         return input_ids, teacher_encodings
@@ -334,8 +435,11 @@ class DistilDataLoader(DataLoader):
         :return: Return filepath of sample if sample exists and is uncorrupted,
         else return None
         """
-        with open(filepath, "r", encoding="utf-8") as f:
-            sample = json.load(f)
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                sample = json.load(f)
+        except json.decoder.JSONDecodeError:
+            print(filepath)
 
         # check all necessary keys are there
         for key in [
@@ -374,9 +478,10 @@ class DistilDataLoader(DataLoader):
         labels = set()
         # Set a minimal nr of classes for a task to be considered. Prototype-based methods have more flexibility as they can model a variable nr of classes
         min_nr_classes = (
-            self.args.num_classes_per_set
-            if not "proto" in self.args.meta_update_method
-            else 2
+            2
+            if ("proto" in self.args.meta_update_method)
+            or (self.args.meta_update_method == "mtl")
+            else self.args.num_classes_per_set
         )
 
         # Iterate over all teacher/language/class combinations
@@ -540,11 +645,25 @@ class DistilDataLoader(DataLoader):
         len_dev = []
         y_dev = []
         label_indices = list(range(len(task_files)))
+        label_names = list(
+            set([os.path.split(os.path.dirname(f[0]))[-1] for f in task_files])
+        )
         for label_ix, class_task_files in enumerate(task_files):
 
             rng.shuffle(class_task_files)
 
-            num_train_samples = self.args.num_samples_per_class
+            num_samples = len(class_task_files)
+            if self.args.finetune_base_model:
+                num_train_samples = int(percentage_train * num_samples)
+            else:
+                num_bootstrap_seeds = (
+                    1
+                    if not self.args.bootstrap_finetune
+                    else self.args.num_bootstrap_seeds
+                )
+                num_train_samples = (
+                    self.args.num_samples_per_class * num_bootstrap_seeds
+                )
 
             # load
             task_samples, sample_lens, task_logits = self.get_class_samples(
@@ -553,6 +672,8 @@ class DistilDataLoader(DataLoader):
                 label_indices,
                 is_gold_label=self.args.val_using_cross_entropy
                 or self.args.meta_loss == "ce",
+                class_names=label_names,
+                num_support_samples=0,
             )
 
             # split
@@ -675,34 +796,49 @@ class DistilDataLoader(DataLoader):
             )
             num_sampled_labels = min(self.num_classes_per_set, len(sizes_task))
 
+            variable_nr_samples = None
+            if self.variable_nr_classes_and_samples:
+                (
+                    num_sampled_labels,
+                    variable_nr_samples,
+                ) = self.get_num_samples_and_classes(len(sizes_task), rng)
+
+            all_label_names = list(self.datasets[dataset_name][class_entry].keys())
             selected_tasks = rng.choice(
-                list(self.datasets[dataset_name][class_entry].keys()),
+                all_label_names,
                 p=sample_probs,
                 size=num_sampled_labels,
                 replace=False,
             )  # Multiple classes within the teacher/lang combination
 
             if is_gold_label or self.args.meta_loss == "ce":
-                random_label_ix = list(range(len(selected_tasks)))
+                if self.args.meta_update_method.lower() == "mtl":
+                    # Keep original label indexes
+                    random_label_ix = [
+                        all_label_names.index(label) for label in selected_tasks
+                    ]
+                else:
+                    random_label_ix = list(range(len(selected_tasks)))
             else:
                 random_label_ix = [int(l) for l in selected_tasks]
 
             for task_entry, label_ix in zip(selected_tasks, random_label_ix):
 
-                num_support_samples = int(
-                    min(
-                        self.num_classes_per_set * self.num_samples_per_class / 2,
-                        int(self.num_classes_per_set / num_sampled_labels)
-                        * self.num_samples_per_class,
-                    )
-                )
-                num_query_samples = int(
-                    min(
-                        self.num_classes_per_set * self.num_samples_per_class / 2,
-                        int(self.num_classes_per_set / num_sampled_labels)
-                        * self.num_target_samples,
-                    )
-                )
+                num_support_samples = self.num_samples_per_class
+                num_query_samples = self.num_target_samples
+
+                # Account for variability in nr of classes
+                num_sample_multiplier = 1
+                for i in range(1, 10):
+                    if num_sampled_labels * i <= self.num_classes_per_set:
+                        num_sample_multiplier = i
+                    else:
+                        break
+                num_support_samples *= num_sample_multiplier
+                num_query_samples *= num_sample_multiplier
+
+                if variable_nr_samples is not None:
+                    num_support_samples = num_query_samples = variable_nr_samples
 
                 if self.split_support_and_query:
                     choose_samples_list = rng.choice(
@@ -729,7 +865,12 @@ class DistilDataLoader(DataLoader):
                     )
                 # Load the chosen samples
                 class_samples, sample_lens, class_encodings = self.get_class_samples(
-                    choose_samples_list, label_ix, random_label_ix, is_gold_label
+                    choose_samples_list,
+                    label_ix,
+                    random_label_ix,
+                    is_gold_label,
+                    selected_tasks,
+                    num_support_samples,
                 )
                 x_samples.append(class_samples)
                 x_sample_lens.append(sample_lens)
@@ -755,6 +896,19 @@ class DistilDataLoader(DataLoader):
         target_set_lens = x_sample_lens[:, num_support_samples:]
         target_set_encodings = teacher_encodings[:, num_support_samples:]
 
+        res = {}
+
+        if self.include_label_names:
+            # Encode class description as substitution of prototypes
+            (
+                class_descr_x,
+                class_descr_len,
+                class_descr_y,
+            ) = self.get_class_descr_samples(class_descr=selected_tasks)
+            res[CLASS_NAMES_KEY] = class_descr_x
+            res[CLASS_NAMES_LENS_KEY] = class_descr_len
+            res[CLASS_NAMES_ENCODING_KEY] = class_descr_y
+
         assert (
             len(selected_classes) == 1
         ), "Only one teacher/lang combination per episode is allowed"
@@ -765,26 +919,52 @@ class DistilDataLoader(DataLoader):
             .replace("test/", "", 1)
         )
 
-        return (
-            support_set_samples,
-            support_set_lens,
-            target_set_samples,
-            target_set_lens,
-            support_set_encodings,
-            target_set_encodings,
-            selected_class,
-            seed,
+        res.update(
+            {
+                SUPPORT_SET_SAMPLES_KEY: support_set_samples,
+                SUPPORT_SET_LENS_KEY: support_set_lens,
+                TARGET_SET_SAMPLES_KEY: target_set_samples,
+                TARGET_SET_LENS_KEY: target_set_lens,
+                SUPPORT_SET_ENCODINGS_KEY: support_set_encodings,
+                TARGET_SET_ENCODINGS_KEY: target_set_encodings,
+                SELECTED_CLASS_KEY: selected_class,
+                SEED_KEY: seed,
+            }
         )
+        return res
 
-    def get_class_samples(self, sample_paths, label_ix, shuffled_labels, is_gold_label):
+    def get_class_samples(
+        self,
+        sample_paths,
+        label_ix,
+        shuffled_labels,
+        is_gold_label,
+        class_names,
+        num_support_samples,
+    ):
+
+        if self.consistency_training and self.current_set_name == "train":
+            # Add augmented samples to query set
+            query_sample_paths = sample_paths[num_support_samples:]
+            # Append augmented samples
+            sample_paths = np.append(
+                sample_paths,
+                [
+                    self.get_aug_sample_path(sample_path)
+                    for sample_path in query_sample_paths
+                ],
+            )
+
         # Loads and prepares samples for 1 class within task
-        class_samples, teacher_encodings = self.load_batch(sample_paths)
+        class_samples, teacher_encodings = self.load_batch(sample_paths, class_names)
 
         class_samples, sample_lens = stack_and_pad_tensors(
             class_samples, padding_index=self.tokenizer.pad_token_id
         )
 
-        if self.args.meta_loss == "ce" or is_gold_label:
+        if self.args.meta_update_method == "mtl":
+            class_encodings = torch.stack(teacher_encodings)
+        elif self.args.meta_loss == "ce" or is_gold_label:
             ohe_label = [0] * len(shuffled_labels)
             ohe_label[label_ix] = 1
             class_encodings = torch.LongTensor([ohe_label] * len(sample_paths))
@@ -793,6 +973,28 @@ class DistilDataLoader(DataLoader):
             class_encodings = torch.stack(teacher_encodings)[:, shuffled_labels]
 
         return class_samples, sample_lens, class_encodings
+
+    def get_aug_sample_path(self, sample_path):
+        sample_dir, sample_name = os.path.split(sample_path)
+
+        sample_name = sample_name.replace(".json", "").replace("Train", "")
+
+        aug_sample_dir = sample_dir.replace("/train/", "/aug/").replace("Train", "")
+        if self.multilingual_consistency_training:
+            aug_sample_dir, class_name = os.path.split(aug_sample_dir)
+            aug_sample_dir = os.path.dirname(aug_sample_dir)
+            available_langs = os.listdir(aug_sample_dir)
+            aug_sample_dir = os.path.join(
+                aug_sample_dir, self.rng.choice(available_langs, size=1)[0], class_name
+            )
+
+        aug_candidates = [
+            os.path.join(aug_sample_dir, f)
+            for f in os.listdir(aug_sample_dir)
+            if f.startswith(sample_name)
+        ]
+
+        return self.rng.choice(aug_candidates, size=1)
 
     def __len__(self):
         total_samples = self.data_length[self.current_set_name]
@@ -813,28 +1015,8 @@ class DistilDataLoader(DataLoader):
         self.seed[dataset_name] = seed
 
     def __getitem__(self, idx):
-        (
-            support_set_samples,
-            support_set_lens,
-            target_set_sample,
-            target_set_lens,
-            support_set_labels,
-            target_set_label,
-            selected_class,
-            seed,
-        ) = self.get_set(
+        return self.get_set(
             self.current_set_name, seed=self.seed[self.current_set_name] + idx
-        )
-
-        return (
-            support_set_samples,
-            support_set_lens,
-            target_set_sample,
-            target_set_lens,
-            support_set_labels,
-            target_set_label,
-            selected_class,
-            seed,
         )
 
     def reset_seed(self):
@@ -843,14 +1025,31 @@ class DistilDataLoader(DataLoader):
 
 def collate_fn(batch):
     # Dissect batch
-    support_set_samples = [b[0] for b in batch]
-    support_set_lens = [b[1] for b in batch]
-    target_set_samples = [b[2] for b in batch]
-    target_set_lens = [b[3] for b in batch]
-    support_set_labels = [b[4] for b in batch]
-    target_set_labels = [b[5] for b in batch]
-    selected_classes = [b[6] for b in batch]
-    seeds = [b[7] for b in batch]
+    support_set_samples = [b[SUPPORT_SET_SAMPLES_KEY] for b in batch]
+    support_set_lens = [b[SUPPORT_SET_LENS_KEY] for b in batch]
+    target_set_samples = [b[TARGET_SET_SAMPLES_KEY] for b in batch]
+    target_set_lens = [b[TARGET_SET_LENS_KEY] for b in batch]
+    support_set_labels = [b[SUPPORT_SET_ENCODINGS_KEY] for b in batch]
+    target_set_labels = [b[TARGET_SET_ENCODINGS_KEY] for b in batch]
+    selected_classes = [b[SELECTED_CLASS_KEY] for b in batch]
+    seeds = [b[SEED_KEY] for b in batch]
+
+    res = {}
+    if CLASS_NAMES_KEY in batch[0].keys():
+        # Process class description samples
+        class_names_x = [b[CLASS_NAMES_KEY] for b in batch]
+        class_names_len = [b[CLASS_NAMES_LENS_KEY] for b in batch]
+        class_names_y = [b[CLASS_NAMES_ENCODING_KEY] for b in batch]
+
+        class_names_mask = [torch.ones_like(s) for s in class_names_x]
+        class_names_mask = [
+            (torch.arange(s.size(1)) < l.contiguous().view(-1).unsqueeze(1)) * s
+            for s, l in zip(class_names_mask, class_names_len)
+        ]
+        # Add to final dict
+        res[CLASS_NAMES_KEY] = class_names_x
+        res[CLASS_NAMES_LENS_KEY] = class_names_mask
+        res[CLASS_NAMES_ENCODING_KEY] = class_names_y
 
     # Flatten samples
     support_set_samples = [
@@ -882,16 +1081,20 @@ def collate_fn(batch):
         s.contiguous().view(s.size(0) * s.size(1), -1) for s in target_set_labels
     ]
 
-    return (
-        support_set_samples,
-        support_set_mask,
-        target_set_samples,
-        target_set_mask,
-        support_set_labels,
-        target_set_labels,
-        selected_classes,
-        seeds,
+    res.update(
+        {
+            SUPPORT_SET_SAMPLES_KEY: support_set_samples,
+            SUPPORT_SET_LENS_KEY: support_set_mask,
+            TARGET_SET_SAMPLES_KEY: target_set_samples,
+            TARGET_SET_LENS_KEY: target_set_mask,
+            SUPPORT_SET_ENCODINGS_KEY: support_set_labels,
+            TARGET_SET_ENCODINGS_KEY: target_set_labels,
+            SELECTED_CLASS_KEY: selected_classes,
+            SEED_KEY: seeds,
+        }
     )
+
+    return res
 
 
 class MetaLearningSystemDataLoader(object):
@@ -989,6 +1192,7 @@ class MetaLearningSystemDataLoader(object):
 
     def get_finetune_dataloaders(self, task_name, percentage_train, seed):
 
+        self.dataset.switch_set(set_name="val")  # TODO: tmp
         (
             train_set_samples,
             train_set_lens,
@@ -1029,7 +1233,27 @@ class MetaLearningSystemDataLoader(object):
             dev_dataset,
             sampler=dev_sampler,
             batch_size=self.dataset.num_samples_per_class
-            * self.dataset.num_classes_per_set,
+            * self.dataset.num_classes_per_set
+            * 5,
+        )
+        res = {}
+        if self.dataset.include_label_names:
+            class_names = ""
+            for d, task_mappings in self.dataset.datasets.items():
+                if task_name in task_mappings.keys():
+                    class_names = list(task_mappings[task_name].keys())
+
+            (
+                class_descr_x,
+                class_descr_len,
+                class_descr_y,
+            ) = self.dataset.get_class_descr_samples(class_descr=class_names)
+            res[CLASS_NAMES_KEY] = class_descr_x
+            res[CLASS_NAMES_LENS_KEY] = torch.ones_like(class_descr_x)
+            res[CLASS_NAMES_ENCODING_KEY] = class_descr_y
+
+        res.update(
+            {TRAIN_DATALOADER_KEY: train_dataloader, DEV_DATALOADER_KEY: dev_dataloader}
         )
 
-        return train_dataloader, dev_dataloader
+        return res

@@ -1,6 +1,5 @@
 import torch
 import numpy as np
-import torch.functional as F
 
 DEFAULT_PADDING_INDEX = 0
 

@@ -15,9 +15,7 @@ from ranger import Ranger
 
 def euclidean_dist(query, prototypes):
     # compute distance from every emb in query to all prototypes
-    return ((query[:, None, :] - prototypes[None, :, :]) ** 2).sum(
-        2
-    )  # [8,1,768] - [1,4,768]
+    return ((query[:, None, :] - prototypes[None, :, :]) ** 2).sum(2)
 
 
 class PrototypicalNetworkFewShotClassifier(FewShotClassifier):
@@ -185,7 +183,6 @@ class PrototypicalNetworkFewShotClassifier(FewShotClassifier):
         eval_every = (
             eval_every if eval_every < len(train_dataloader) else len(train_dataloader)
         )
-        total_iters = -1
 
         ###############################################################################
         # Start finetuning

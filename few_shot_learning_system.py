@@ -5,7 +5,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.autograd.profiler as profiler
+from optimizers.radam import RAdam
 from utils.torch_utils import cross_entropy_with_probs
+from dataloader import *
 
 
 class MyDataParallel(nn.DataParallel):
@@ -71,6 +73,11 @@ class FewShotClassifier(nn.Module):
 
         self.task_learning_rate = args.init_inner_loop_learning_rate
 
+        # consistency training
+        self.use_consistency_loss = args.use_consistency_loss
+        self.consistency_lambda = args.consistency_loss_lambda
+        self.consistency_beta = args.consistency_loss_beta
+
     def get_across_task_loss_metrics(self, total_losses):
         losses = dict()
 
@@ -92,6 +99,40 @@ class FewShotClassifier(nn.Module):
         else:
             raise AssertionError("--meta_loss should be either 'ce' or 'kl'.")
 
+    def consistency_loss(self, student_logits, teacher_logits, y_true):
+
+        teacher_logits = teacher_logits.detach()
+
+        # teacher_probs = F.softmax(teacher_logits, dim=-1)
+        _, teacher_preds = teacher_logits.max(dim=1)
+        _, y_true_index = y_true.max(dim=1)
+
+        correct_classified = teacher_preds == y_true_index
+
+        # KL samples
+        if correct_classified.sum() > 0:
+            kl_loss = self.consistency_lambda * self._teacher_KL_loss(
+                student_logits=student_logits[correct_classified],
+                teacher_logits=teacher_logits[correct_classified],
+                return_nr_correct=False,
+            )
+        else:
+            kl_loss = 0
+        # CE samples
+        if (~correct_classified).sum() > 0:
+            ce_loss = self._teacher_cross_entropy(
+                student_logits=student_logits[~correct_classified],
+                teacher_preds=y_true_index[~correct_classified],
+                return_nr_correct=False,
+            )
+        else:
+            ce_loss = 0
+
+        return (
+            correct_classified.float().mean() * kl_loss,
+            (1 - correct_classified.float().mean()) * ce_loss,
+        )
+
     def _teacher_KL_loss(self, student_logits, teacher_logits, return_nr_correct=False):
 
         loss = (
@@ -99,7 +140,7 @@ class FewShotClassifier(nn.Module):
                 F.log_softmax(student_logits / self.temperature, dim=-1),
                 F.softmax(teacher_logits / self.temperature, dim=-1),
             )
-            * (self.temperature) ** 1  # TODO: temp, restore to **2
+            # * (self.temperature) ** 2
         )
 
         if torch.isnan(loss):
@@ -355,6 +396,7 @@ class FewShotClassifier(nn.Module):
         model_save_dir,
         task_name,
         epoch,
+        **kwargs
     ):
         """
         Finetunes the meta-learned classifier on a dataset
@@ -425,33 +467,19 @@ class FewShotClassifier(nn.Module):
         if not self.training:
             self.train()
 
-        (
-            x_support_set,
-            len_support_set,
-            x_target_set,
-            len_target_set,
-            y_support_set,
-            y_target_set,
-            teacher_names,
-        ) = data_batch
-
-        x_support_set = [x.to(self.device) for x in x_support_set]
-        len_support_set = [x.to(self.device) for x in len_support_set]
-        y_support_set = [y.to(self.device) for y in y_support_set]
-
-        x_target_set = [x.to(self.device) for x in x_target_set]
-        len_target_set = [x.to(self.device) for x in len_target_set]
-        y_target_set = [y.to(self.device) for y in y_target_set]
-
-        data_batch = (
-            x_support_set,
-            len_support_set,
-            x_target_set,
-            len_target_set,
-            y_support_set,
-            y_target_set,
-            teacher_names,
-        )
+        for k in [
+            SUPPORT_SET_SAMPLES_KEY,
+            SUPPORT_SET_LENS_KEY,
+            SUPPORT_SET_ENCODINGS_KEY,
+            TARGET_SET_SAMPLES_KEY,
+            TARGET_SET_LENS_KEY,
+            TARGET_SET_ENCODINGS_KEY,
+            CLASS_NAMES_KEY,
+            CLASS_NAMES_LENS_KEY,
+            CLASS_NAMES_ENCODING_KEY,
+        ]:
+            if k in data_batch.keys():
+                data_batch[k] = [x.to(self.device) for x in data_batch[k]]
 
         # with profiler.profile(profile_memory=True, use_cuda=True) as prof:
         losses, task_lang_log = self.train_forward_prop(
@@ -462,8 +490,7 @@ class FewShotClassifier(nn.Module):
 
         self.optimizer.step()
 
-        self.scheduler.step(epoch=epoch * self.args.total_iter_per_epoch)
-        losses["learning_rate"] = self.scheduler.get_lr()[0]
+        losses["learning_rate"] = self.optimizer.current_lr
         self.optimizer.zero_grad()
         self.zero_grad()
 
@@ -485,33 +512,19 @@ class FewShotClassifier(nn.Module):
         if self.training:
             self.eval()
 
-        (
-            x_support_set,
-            len_support_set,
-            x_target_set,
-            len_target_set,
-            y_support_set,
-            y_target_set,
-            teacher_names,
-        ) = data_batch
-
-        x_support_set = [x.to(self.device) for x in x_support_set]
-        len_support_set = [x.to(self.device) for x in len_support_set]
-        y_support_set = [y.to(self.device) for y in y_support_set]
-
-        x_target_set = [x.to(self.device) for x in x_target_set]
-        len_target_set = [x.to(self.device) for x in len_target_set]
-        y_target_set = [y.to(self.device) for y in y_target_set]
-
-        data_batch = (
-            x_support_set,
-            len_support_set,
-            x_target_set,
-            len_target_set,
-            y_support_set,
-            y_target_set,
-            teacher_names,
-        )
+        for k in [
+            SUPPORT_SET_SAMPLES_KEY,
+            SUPPORT_SET_LENS_KEY,
+            SUPPORT_SET_ENCODINGS_KEY,
+            TARGET_SET_SAMPLES_KEY,
+            TARGET_SET_LENS_KEY,
+            TARGET_SET_ENCODINGS_KEY,
+            CLASS_NAMES_KEY,
+            CLASS_NAMES_LENS_KEY,
+            CLASS_NAMES_ENCODING_KEY,
+        ]:
+            if k in data_batch.keys():
+                data_batch[k] = [x.to(self.device) for x in data_batch[k]]
 
         losses = self.evaluation_forward_prop(
             data_batch=data_batch, epoch=self.current_epoch

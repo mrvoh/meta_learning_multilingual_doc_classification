@@ -4,11 +4,13 @@ import torch.nn as nn
 import math
 import torch
 import os
-from transformers import WEIGHTS_NAME, AutoModel, AutoModelForSequenceClassification
-# from transformers.models.roberta.modeling_roberta import create_position_ids_from_input_ids
-from transformers.models.roberta.modeling_roberta import create_position_ids_from_input_ids
-from copy import deepcopy
+from transformers import WEIGHTS_NAME, AutoModel
+
 from meta_neural_network_architectures import *
+from transformers import AdapterConfig, AdapterType
+
+
+META_ADAPTER_NAME = "adapter"
 
 
 def per_step_layer_norm(model, num_steps):
@@ -19,27 +21,38 @@ def per_step_layer_norm(model, num_steps):
             per_step_layer_norm(child, num_steps)
 
 
-class MetaBERT(nn.Module):
-    def __init__(
-        self, config, is_distil, is_xlm, per_step_layer_norm_weights=True, device="cpu"
-    ):
-        super(MetaBERT, self).__init__()  # config)
+class MetaAdapterBERT(nn.Module):
+    def __init__(self, config, is_distil, is_xlm, device="cpu"):
+        super(MetaAdapterBERT, self).__init__()  # config)
 
         self.is_distil = is_distil
         self.is_xlm = is_xlm
-        self.per_step_layer_norm_weights = per_step_layer_norm_weights
 
         self.config = config
         if is_xlm:
             self.embeddings = MetaRoBertaEmbedding(config, is_distil)
         else:
             self.embeddings = MetaBertEmbedding(config, is_distil)
-        self.encoder = MetaBertEncoder(config, is_distil)
+
+        self.encoder = MetaBertEncoder(config, is_distil, use_adapter=True)
 
         self.classifier = MetaBertClassHead(config)
 
         self.fast_weights = None
+
         self.device = torch.device(device)
+
+    def train_adapter(self, adapter_name=META_ADAPTER_NAME):
+
+        for name, parameter in self.named_parameters():
+            if adapter_name in name:
+                parameter.requires_grad = True
+            else:
+                parameter.requires_grad = False
+
+        # Also unfreeze parameters in classifier
+        for p in self.classifier.parameters():
+            p.requires_grad = True
 
     def freeze(self, freeze_classifier=False):
         # Freeze the model up to the classification head
@@ -53,15 +66,16 @@ class MetaBERT(nn.Module):
             for p in self.classifier.parameters():
                 p.requires_grad = False
 
-    def unfreeze(self):
+    def unfreeze(self, adapter_name=META_ADAPTER_NAME):
 
-        for p in self.parameters():
-            p.requires_grad = True
+        self.train_adapter(adapter_name=adapter_name)
 
     def get_inner_loop_params(self):
 
         params = {
-            param_name: param.to(self.device)
+            param_name: param
+            if ("classifier" in param_name or "adapter" in param_name)
+            else None
             for param_name, param in self.named_parameters()
         }
         return params
@@ -82,11 +96,10 @@ class MetaBERT(nn.Module):
         config.num_labels = num_labels
 
         if is_xlm:
-            pass
-            # state_dict = {
-            #     k.replace("pooler", "classifier").replace("roberta.", "", 1): v
-            #     for k, v in state_dict.items()
-            # }
+            state_dict = {
+                k.replace("pooler", "classifier").replace("roberta.", "", 1): v
+                for k, v in state_dict.items()
+            }
 
         if is_distil:  # convert differences in naming
             state_dict = {
@@ -104,6 +117,10 @@ class MetaBERT(nn.Module):
                         k
                     )
                 )
+            else:
+                if "classifier" in k:  # classification head is always trained
+                    state_dict[k].requires_grad = True
+                curr_state_dict[k].requires_grad = state_dict[k].requires_grad
 
         # Load the weights
         self.load_state_dict(state_dict, strict=False)
@@ -112,61 +129,6 @@ class MetaBERT(nn.Module):
             per_step_layer_norm(self, num_inner_loop_steps)
 
         return self
-
-    def forward_from(self, hidden_states, layer, num_step, params=None):
-        # Infers the model starting at layer layer
-        encoder_params = None
-        class_head_params = None
-        if params is not None:
-            params = extract_top_level_dict(current_dict=params)
-            encoder_params = params["encoder"]
-            class_head_params = params["classifier"]
-
-        encoder_extended_attention_mask = None
-
-        input_shape = hidden_states.size()[:-1]
-
-        device = hidden_states.device
-
-        attention_mask = torch.ones(input_shape, device=device)
-
-        # We can provide a self-attention mask of dimensions [batch_size, from_seq_length, to_seq_length]
-        # ourselves in which case we just need to make it broadcastable to all heads.
-        extended_attention_mask: torch.Tensor = self.get_extended_attention_mask(
-            attention_mask, input_shape, self.device
-        )
-        head_mask = self.get_head_mask(None, self.config.num_hidden_layers)
-
-        encoder_outputs = self.encoder(
-            hidden_states=hidden_states,
-            num_step=num_step,
-            attention_mask=extended_attention_mask,
-            head_mask=head_mask,
-            encoder_hidden_states=None,
-            encoder_attention_mask=encoder_extended_attention_mask,
-            params=encoder_params,
-            layer_from=layer,
-        )
-        sequence_output = encoder_outputs[0]
-
-        logits, pooled = self.classifier(
-            sequence_output, return_pooled=True, params=class_head_params
-        )
-
-        return logits, pooled, encoder_outputs
-
-    def class_head_forward(self, pooler, params):
-
-        if params is not None:
-            params = extract_top_level_dict(current_dict=params)
-            class_head_params = params["classifier"]
-
-            class_head_params = extract_top_level_dict(current_dict=class_head_params)
-            out_params = class_head_params["out_proj"]
-
-        logits = self.classifier.out_proj(pooler, params=out_params)
-
-        return logits
 
     def forward(
         self,
@@ -180,7 +142,7 @@ class MetaBERT(nn.Module):
         encoder_hidden_states=None,
         encoder_attention_mask=None,
         params=None,
-        training=None,
+        training=None,  # TODO: refactor
         return_hidden_states=False,
         return_pooled=False,
     ):
@@ -214,7 +176,7 @@ class MetaBERT(nn.Module):
         # We can provide a self-attention mask of dimensions [batch_size, from_seq_length, to_seq_length]
         # ourselves in which case we just need to make it broadcastable to all heads.
         extended_attention_mask: torch.Tensor = self.get_extended_attention_mask(
-            attention_mask, input_shape, self.device
+            attention_mask, input_shape, device
         )
 
         # If a 2D ou 3D attention mask is provided for the cross-attention
@@ -243,7 +205,6 @@ class MetaBERT(nn.Module):
             params=embedding_params,
             num_step=num_step,
         )
-
         encoder_outputs = self.encoder(
             hidden_states=embedding_output,
             num_step=num_step,
@@ -258,8 +219,6 @@ class MetaBERT(nn.Module):
         logits, pooled = self.classifier(
             sequence_output, return_pooled=return_pooled, params=class_head_params
         )
-
-        return logits, pooled, encoder_outputs
         if return_hidden_states:
             return logits, sequence_output
         elif return_pooled:
@@ -350,7 +309,6 @@ def distil_to_bert_config(config):
 
 
 def distil_state_dict_to_bert(k):
-
     k = k.replace("distilbert.", "")
     k = k.replace("preclassifier.", "classifier.dense.")
     k = k.replace("classifier.weight", "classifier.out_proj.weight")
@@ -364,7 +322,10 @@ def distil_state_dict_to_bert(k):
     k = k.replace("output_layer_norm", "output.LayerNorm")
     k = k.replace("ffn.lin1", "intermediate.dense")
     k = k.replace("ffn.lin2", "output.dense")
-    k = k.replace("n_layers", "num_hidden_layers")
+
+    # if 'adapter' in k:
+    k = k.replace("attention_adapters", "attention.output")
+    k = k.replace("output_adapters", "output")
 
     return k
 
@@ -373,20 +334,34 @@ if __name__ == "__main__":
 
     is_distil = False
     is_xlm = True
-    bert = AutoModelForSequenceClassification.from_pretrained("xlm-roberta-base")
+    bert = AutoModel.from_pretrained("xlm-roberta-base")
+    # load "pfeiffer" config from Hub, but replace the reduction factor
+    adapter_config = AdapterConfig.load(
+        "houlsby", reduction_factor=12, original_ln_after=False
+    )
+    # add a new adapter with the loaded config
+    bert.add_adapter(META_ADAPTER_NAME, AdapterType.text_task, config=adapter_config)
     bert.eval()
     t = bert.state_dict()
     config = bert.config
-    classifier = MetaBERT.init_from_pretrained(
+    config.adapter_down_sample_size = int(
+        config.hidden_size / adapter_config.reduction_factor
+    )
+    classifier = MetaAdapterBERT.init_from_pretrained(
         t,
         config,
-        num_labels=2,
+        num_labels=4,
         is_distil=is_distil,
         is_xlm=is_xlm,
         per_step_layer_norm_weights=True,
         num_inner_loop_steps=5,
-        # init_class_head=True
     )
+    # Fast model
+    fast_model = FunctionalAdapterBert(
+        None, classifier.config, is_distil=is_distil, is_xlm=is_xlm, is_protomaml=False
+    )
+    fast_model.set_fast_weights(classifier.named_parameters())
+    fast_model.eval()
     classifier.eval()
     s = classifier.state_dict()
     # meta_bert.load_state_dict(t)
@@ -401,9 +376,8 @@ if __name__ == "__main__":
         ]
     ).to(torch.long)
 
-    # m_out = classifier(0, input_ids=input_ids)
-    # b_out = bert(input_ids)
     m_out = classifier(0, input_ids=input_ids, return_hidden_states=True)
+    fast_out = fast_model(num_step=0, input_ids=input_ids, is_train=False)
     m_functional_out = classifier(
         0,
         input_ids=input_ids,
@@ -412,17 +386,40 @@ if __name__ == "__main__":
     )
     b_out = bert(input_ids)
 
+    print(classifier)
     for (n1, p1), (n2, p2) in zip(
         classifier.named_parameters(), bert.named_parameters()
     ):
         if p1.data.ne(p2.data).sum() > 0:
             print(n1, n2, "False")
+            print(p1.shape, p2.shape)
+
+    # assert (m_out[1].ne(b_out[0])).sum() == 0, "Output not consistent between MetaBert and Bert"
+    # assert (b_out[0].ne(fast_out[1])).sum() == 0, "Output not consistent between FunctionalBert and Bert"
 
     assert (
         m_functional_out[0].ne(m_out[0])
     ).sum() == 0, "Output not consistent between FunctionalBert and MetaBert"
     assert (
-        b_out[0].ne(m_out[0])
-    ).sum() == 0, "Output not consistent between Bert and MetaBert"
-    # assert (fast_out[1].ne(m_out[1])).sum() == 0, "Output not consistent between FunctionalBert and MetaBert"
-    # assert (m_out.ne(b_out[0])).sum() == 0, "Output not consistent between MetaBert and Bert"
+        fast_out[0].ne(m_out[0])
+    ).sum() == 0, "Output not consistent between FunctionalBert and MetaBert"
+    assert (
+        fast_out[1].ne(m_out[1])
+    ).sum() == 0, "Output not consistent between FunctionalBert and MetaBert"
+    # token_type_ids = torch.Tensor(
+    #     [[0, 0, 0, 0, 0, 1, 1, 1, 1], [0, 0, 0, 0, 0, 1, 1, 1, 1]]
+    # ).to(torch.long)
+    # attention_mask = torch.Tensor(
+    #     [[1, 1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1, 1, 1, 1]]
+    # ).to(torch.long)
+    #
+    # print(
+    #     functional_bert(
+    #         fast_weights,
+    #         model.config,
+    #         input_ids=input_ids,
+    #         attention_mask=attention_mask,
+    #         token_type_ids=token_type_ids,
+    #         is_train=True,
+    #     )
+    # )
